@@ -1,7 +1,7 @@
 /*
  * Portable Audio I/O Library WASAPI implementation
  * Copyright (c) 2006-2010 David Viens
- * Copyright (c) 2010-2019 Dmitry Kostjuchenko
+ * Copyright (c) 2010-2022 Dmitry Kostjuchenko
  *
  * Based on the Open Source API proposed by Ross Bencina
  * Copyright (c) 1999-2019 Ross Bencina, Phil Burk
@@ -367,6 +367,7 @@ enum { WASAPI_PACKETS_PER_INPUT_BUFFER = 6 };
 
 #define SAFE_CLOSE(h) if ((h) != NULL) { CloseHandle((h)); (h) = NULL; }
 #define SAFE_RELEASE(punk) if ((punk) != NULL) { (punk)->lpVtbl->Release((punk)); (punk) = NULL; }
+#define SAFE_ADDREF(punk) if ((punk) != NULL) { (punk)->lpVtbl->AddRef((punk)); }
 
 // Mixer function
 typedef void (*MixMonoToStereoF) (void *__to, const void *__from, UINT32 count);
@@ -478,12 +479,15 @@ typedef struct PaWasapiDeviceInfo
 
     // Form-factor
     EndpointFormFactor formFactor;
+
+	// Loopback state (TRUE if device acts as loopback)
+	BOOL loopBack;
 }
 PaWasapiDeviceInfo;
 
 // ------------------------------------------------------------------------------------------
 /* PaWasapiHostApiRepresentation - host api datastructure specific to this implementation */
-typedef struct
+typedef struct PaWasapiHostApiRepresentation
 {
     PaUtilHostApiRepresentation inheritedHostApiRep;
     PaUtilStreamInterface       callbackStreamInterface;
@@ -569,7 +573,6 @@ PaWasapiHostProcessor;
 // ------------------------------------------------------------------------------------------
 typedef struct PaWasapiStream
 {
-    /* IMPLEMENT ME: rename this */
     PaUtilStreamRepresentation streamRepresentation;
     PaUtilCpuLoadMeasurer      cpuLoadMeasurer;
     PaUtilBufferProcessor      bufferProcessor;
@@ -592,21 +595,24 @@ typedef struct PaWasapiStream
     IAudioRenderClient        *renderClient;
     IAudioEndpointVolume      *outVol;
 
-    // event handles for event-driven processing mode
+    // Event handles for event-driven processing mode
     HANDLE event[S_COUNT];
 
-    // buffer mode
+    // Buffer mode
     PaUtilHostBufferSizeMode bufferMode;
 
-    // must be volatile to avoid race condition on user query while
-    // thread is being started
-    volatile BOOL running;
+    // Stream state: active (can be reset inside the processing thread,
+    // to avoid reading incorrected cached state)
+    volatile BOOL isActive;
+
+    // Stream state: stopped (triggered by user only via external API)
+    BOOL isStopped;
 
     PA_THREAD_ID dwThreadId;
     HANDLE hThread;
     HANDLE hCloseRequest;
-    HANDLE hThreadStart;        //!< signalled by thread on start
-    HANDLE hThreadExit;         //!< signalled by thread on exit
+    HANDLE hThreadStart;        // signalled by thread on start
+    HANDLE hThreadExit;         // signalled by thread on exit
     HANDLE hBlockingOpStreamRD;
     HANDLE hBlockingOpStreamWR;
 
@@ -617,7 +623,7 @@ typedef struct PaWasapiStream
     PaWasapiHostProcessor hostProcessOverrideInput;
 
     // Defines blocking/callback interface used
-    BOOL bBlocking;
+    BOOL isBlocking;
 
     // Av Task (MM thread management)
     HANDLE hAvTask;
@@ -641,7 +647,6 @@ static void ReleaseUnmarshaledComPointers(PaWasapiStream *stream);
 
 // Local methods
 static void _StreamOnStop(PaWasapiStream *stream);
-static void _StreamFinish(PaWasapiStream *stream);
 static void _StreamCleanup(PaWasapiStream *stream);
 static HRESULT _PollGetOutputFramesAvailable(PaWasapiStream *stream, UINT32 *available);
 static HRESULT _PollGetInputFramesAvailable(PaWasapiStream *stream, UINT32 *available);
@@ -691,7 +696,7 @@ PaWasapiWinrtDeviceListContext;
 
 // ------------------------------------------------------------------------------------------
 #define LogHostError(HRES) __LogHostError(HRES, __FUNCTION__, __FILE__, __LINE__)
-static HRESULT __LogHostError(HRESULT res, const char *func, const char *file, int line)
+static HRESULT __LogHostError(const HRESULT res, const char *func, const char *file, int line)
 {
     const char *text = NULL;
     switch (res)
@@ -1207,6 +1212,8 @@ static BOOL IsWindowsVersionOrGreater(WORD wMajorVersion, WORD wMinorVersion, WO
 }
 #endif
 // Get Windows version
+// note: We are trying to get Windows version starting from Windows Vista. Earlier OS versions
+//       will fall into WINDOWS_UNKNOWN case.
 static EWindowsVersion GetWindowsVersion()
 {
 #ifndef PA_WINRT
@@ -1229,14 +1236,14 @@ static EWindowsVersion GetWindowsVersion()
         {
             OSVERSIONINFOW ver = { sizeof(OSVERSIONINFOW), 0, 0, 0, 0, {0} };
 
-            PRINT(("WASAPI: getting Windows version with RtlGetVersion()\n"));
-
             if (fnRtlGetVersion(&ver) == NTSTATUS_SUCCESS)
             {
                 dwMajorVersion = ver.dwMajorVersion;
                 dwMinorVersion = ver.dwMinorVersion;
                 dwBuild        = ver.dwBuildNumber;
             }
+            
+            PRINT(("WASAPI: getting Windows version with RtlGetVersion(): major=%d, minor=%d, build=%d\n", dwMajorVersion, dwMinorVersion, dwBuild));
         }
 
         #undef NTSTATUS_SUCCESS
@@ -1249,17 +1256,15 @@ static EWindowsVersion GetWindowsVersion()
 
             if ((fnGetVersion = (LPFN_GETVERSION)GetProcAddress(GetModuleHandleA("kernel32"), "GetVersion")) != NULL)
             {
-                DWORD dwVersion;
-
-                PRINT(("WASAPI: getting Windows version with GetVersion()\n"));
-
-                dwVersion = fnGetVersion();
+                DWORD dwVersion = fnGetVersion();
 
                 dwMajorVersion = (DWORD)(LOBYTE(LOWORD(dwVersion)));
                 dwMinorVersion = (DWORD)(HIBYTE(LOWORD(dwVersion)));
 
                 if (dwVersion < 0x80000000)
                     dwBuild = (DWORD)(HIWORD(dwVersion));
+                
+                PRINT(("WASAPI: getting Windows version with GetVersion(): major=%d, minor=%d, build=%d\n", dwMajorVersion, dwMinorVersion, dwBuild));
             }
         }
 
@@ -1974,9 +1979,9 @@ static PaError FillDeviceInfo(PaWasapiHostApiRepresentation *paWasapi, void *pEn
 
     // Set default Output/Input devices
     if ((defaultRenderId != NULL) && (wcsncmp(wasapiDeviceInfo->deviceId, defaultRenderId, PA_WASAPI_DEVICE_NAME_LEN - 1) == 0))
-        hostApi->info.defaultOutputDevice = hostApi->info.deviceCount;
+        hostApi->info.defaultOutputDevice = index;
     if ((defaultCaptureId != NULL) && (wcsncmp(wasapiDeviceInfo->deviceId, defaultCaptureId, PA_WASAPI_DEVICE_NAME_LEN - 1) == 0))
-        hostApi->info.defaultInputDevice = hostApi->info.deviceCount;
+        hostApi->info.defaultInputDevice = index;
 
     // Get a temporary IAudioClient for more details
     {
@@ -2070,22 +2075,21 @@ error:
 }
 
 // ------------------------------------------------------------------------------------------
-static PaDeviceInfo *AllocateDeviceListMemory(PaWasapiHostApiRepresentation *paWasapi)
+static PaDeviceInfo *AllocateDeviceListMemory(PaWasapiHostApiRepresentation *paWasapi, UINT32 deviceCount)
 {
     PaUtilHostApiRepresentation *hostApi = (PaUtilHostApiRepresentation *)paWasapi;
     PaDeviceInfo *deviceInfoArray = NULL;
 
     if ((paWasapi->devInfo = (PaWasapiDeviceInfo *)PaUtil_GroupAllocateMemory(paWasapi->allocations,
-        sizeof(PaWasapiDeviceInfo) * paWasapi->deviceCount)) == NULL)
+        sizeof(PaWasapiDeviceInfo) * deviceCount)) == NULL)
     {
         return NULL;
     }
-    memset(paWasapi->devInfo, 0, sizeof(PaWasapiDeviceInfo) * paWasapi->deviceCount);
+    memset(paWasapi->devInfo, 0, sizeof(PaWasapiDeviceInfo) * deviceCount);
 
-    if (paWasapi->deviceCount != 0)
+    if (deviceCount != 0)
     {
         UINT32 i;
-        UINT32 deviceCount = paWasapi->deviceCount;
     #if defined(PA_WASAPI_MAX_CONST_DEVICE_COUNT) && (PA_WASAPI_MAX_CONST_DEVICE_COUNT > 0)
         if (deviceCount < PA_WASAPI_MAX_CONST_DEVICE_COUNT)
             deviceCount = PA_WASAPI_MAX_CONST_DEVICE_COUNT;
@@ -2112,12 +2116,100 @@ static PaDeviceInfo *AllocateDeviceListMemory(PaWasapiHostApiRepresentation *paW
 }
 
 // ------------------------------------------------------------------------------------------
+#ifndef PA_WINRT
+static UINT32 GetDeviceListDeviceCount(IMMDeviceCollection *pEndPoints, EDataFlow filterFlow)
+{
+    HRESULT hr;
+    UINT32 deviceCount;
+    IMMDevice *device;
+    IMMEndpoint *endpoint;
+    EDataFlow flow;
+    UINT32 ret = 0;
+
+    hr = IMMDeviceCollection_GetCount(pEndPoints, &deviceCount);
+    IF_FAILED_JUMP(hr, error);
+
+    for (UINT32 i = 0; i < deviceCount; ++i)
+    {
+        hr = IMMDeviceCollection_Item((IMMDeviceCollection *)pEndPoints, i, &device);
+        IF_FAILED_JUMP(hr, error);
+
+        if (SUCCEEDED(hr = IMMDevice_QueryInterface(device, &pa_IID_IMMEndpoint, (void **)&endpoint)))
+        {
+            if (SUCCEEDED(hr = IMMEndpoint_GetDataFlow(endpoint, &flow)))
+                ret += (flow == filterFlow);
+
+            SAFE_RELEASE(endpoint);
+        }
+
+        SAFE_RELEASE(device);
+    }
+
+    return ret;
+
+error:
+
+    return 0;
+}
+#else
+static UINT32 GetDeviceListDeviceCount(const PaWasapiHostApiRepresentation *paWasapi, 
+    const PaWasapiWinrtDeviceListContext *deviceListContext, EDataFlow filterFlow)
+{
+    UINT32 i, ret = 0;
+
+    for (i = 0; i < paWasapi->deviceCount; ++i)
+        ret += (deviceListContext->devices[i].flow == filterFlow);
+
+    return ret;
+}
+#endif
+
+// ------------------------------------------------------------------------------------------
+static BOOL FillLooopbackDeviceInfo(PaWasapiHostApiRepresentation *paWasapi, PaDeviceInfo *loopbackDeviceInfo,
+    PaWasapiDeviceInfo *loopbackWasapiInfo, const PaDeviceInfo *deviceInfo, const PaWasapiDeviceInfo *wasapiInfo)
+{
+// Loopback device name identificator
+// note: Some projects depend on loopback device detection by device name, do not change!
+#define PA_WASAPI_LOOPBACK_NAME_IDENTIFICATOR "[Loopback]"
+
+    memcpy(loopbackDeviceInfo, deviceInfo, sizeof(*loopbackDeviceInfo));
+    memcpy(loopbackWasapiInfo, wasapiInfo, sizeof(*loopbackWasapiInfo));
+
+    // Append loopback device name identificator to the device name to provide possibility to find
+    // loopback device by its name for some external projects
+    loopbackDeviceInfo->name = (char *)PaUtil_GroupAllocateMemory(paWasapi->allocations, PA_WASAPI_DEVICE_NAME_LEN + 1);
+    if (loopbackDeviceInfo->name == NULL)
+        return FALSE;
+    _snprintf((char *)loopbackDeviceInfo->name, PA_WASAPI_DEVICE_NAME_LEN - 1,
+        "%s " PA_WASAPI_LOOPBACK_NAME_IDENTIFICATOR, deviceInfo->name);
+
+    // Acquire ref to the device as it is already referenced as render (output) device
+    // to avoid duplicate release in ReleaseWasapiDeviceInfoList()
+#ifndef PA_WINRT
+    SAFE_ADDREF(loopbackWasapiInfo->device);
+#endif
+
+    // Mark as loopback device
+    loopbackWasapiInfo->loopBack = TRUE;
+
+    // Input is the reverse of Output
+    loopbackDeviceInfo->maxInputChannels		 = deviceInfo->maxOutputChannels;
+    loopbackDeviceInfo->defaultHighInputLatency	 = deviceInfo->defaultHighOutputLatency;
+    loopbackDeviceInfo->defaultLowInputLatency	 = deviceInfo->defaultLowOutputLatency;
+    loopbackDeviceInfo->maxOutputChannels		 = 0;
+    loopbackDeviceInfo->defaultHighOutputLatency = 0;
+    loopbackDeviceInfo->defaultLowOutputLatency	 = 0;
+
+    return TRUE;
+}
+
+// ------------------------------------------------------------------------------------------
 static PaError CreateDeviceList(PaWasapiHostApiRepresentation *paWasapi, PaHostApiIndex hostApiIndex)
 {
     PaUtilHostApiRepresentation *hostApi = (PaUtilHostApiRepresentation *)paWasapi;
     PaError result = paNoError;
     PaDeviceInfo *deviceInfoArray = NULL;
-    UINT32 i;
+    UINT32 i, j, loopbackDevices;
     WCHAR *defaultRenderId = NULL;
     WCHAR *defaultCaptureId = NULL;
 #ifndef PA_WINRT
@@ -2183,6 +2275,9 @@ static PaError CreateDeviceList(PaWasapiHostApiRepresentation *paWasapi, PaHostA
     // Get device count
     hr = IMMDeviceCollection_GetCount(pEndPoints, &paWasapi->deviceCount);
     IF_FAILED_INTERNAL_ERROR_JUMP(hr, result, error);
+
+    // Get loopback device count (e.g. all renders)
+    loopbackDevices = GetDeviceListDeviceCount(pEndPoints, eRender);
 #else
     WinRT_GetDefaultDeviceId(defaultRender.id, STATIC_ARRAY_SIZE(defaultRender.id) - 1, eRender);
     defaultRenderId = defaultRender.id;
@@ -2231,19 +2326,24 @@ static PaError CreateDeviceList(PaWasapiHostApiRepresentation *paWasapi, PaHostA
             paWasapi->deviceCount++;
         }
     }
+
+    // Get loopback device count (e.g. all renders)
+    loopbackDevices = GetDeviceListDeviceCount(paWasapi, &deviceListContext, eRender);
 #endif
 
     // Allocate memory for the device list
-    if ((paWasapi->deviceCount != 0) && ((deviceInfoArray = AllocateDeviceListMemory(paWasapi)) == NULL))
+    if ((paWasapi->deviceCount != 0) &&
+        ((deviceInfoArray = AllocateDeviceListMemory(paWasapi, paWasapi->deviceCount + loopbackDevices)) == NULL))
     {
         result = paInsufficientMemory;
         goto error;
     }
 
     // Fill WASAPI device info
-    for (i = 0; i < paWasapi->deviceCount; ++i)
+    for (i = 0, j = 0; i < paWasapi->deviceCount; ++i)
     {
         PaDeviceInfo *deviceInfo = &deviceInfoArray[i];
+        PaWasapiDeviceInfo *wasapiInfo = &paWasapi->devInfo[i];
 
         PA_DEBUG(("WASAPI: device idx: %02d\n", i));
         PA_DEBUG(("WASAPI: ---------------\n"));
@@ -2251,7 +2351,7 @@ static PaError CreateDeviceList(PaWasapiHostApiRepresentation *paWasapi, PaHostA
         FillBaseDeviceInfo(deviceInfo, hostApiIndex);
 
         if ((result = FillDeviceInfo(paWasapi, pEndPoints, i, defaultRenderId, defaultCaptureId,
-            deviceInfo, &paWasapi->devInfo[i]
+            deviceInfo, wasapiInfo
         #ifdef PA_WINRT
             , &deviceListContext
         #endif
@@ -2264,7 +2364,29 @@ static PaError CreateDeviceList(PaWasapiHostApiRepresentation *paWasapi, PaHostA
 
         hostApi->deviceInfos[i] = deviceInfo;
         ++hostApi->info.deviceCount;
+
+        // Add loopback device for the render device
+        if ((paWasapi->devInfo[i].flow == eRender) && (j < loopbackDevices))
+        {
+            // Add loopback device to the end of the device list
+            UINT32 loopbackIndex = paWasapi->deviceCount + j++;
+			assert(loopbackIndex < (paWasapi->deviceCount + loopbackDevices));
+            PaDeviceInfo *loopbackDeviceInfo = &deviceInfoArray[loopbackIndex];
+            PaWasapiDeviceInfo *loopbackWasapiInfo = &paWasapi->devInfo[loopbackIndex];
+
+            if (!FillLooopbackDeviceInfo(paWasapi, loopbackDeviceInfo, loopbackWasapiInfo, deviceInfo, wasapiInfo))
+            {
+                result = paInsufficientMemory;
+                goto error;
+            }
+
+            hostApi->deviceInfos[loopbackIndex] = loopbackDeviceInfo;
+            ++hostApi->info.deviceCount;
+        }
     }
+
+    // Resize device list to accomodate inserted loopback devices
+    paWasapi->deviceCount += loopbackDevices;
 
     // Fill the remaining slots with inactive device info
 #if defined(PA_WASAPI_MAX_CONST_DEVICE_COUNT) && (PA_WASAPI_MAX_CONST_DEVICE_COUNT > 0)
@@ -2288,7 +2410,7 @@ static PaError CreateDeviceList(PaWasapiHostApiRepresentation *paWasapi, PaHostA
     // Clear any non-fatal errors
     result = paNoError;
 
-    PRINT(("WASAPI: device list ok - found %d devices\n", paWasapi->deviceCount));
+    PRINT(("WASAPI: device list ok - found %d devices, %d loopback devices\n", paWasapi->deviceCount, loopbackDevices));
 
 done:
 
@@ -2319,9 +2441,16 @@ PaError PaWasapi_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiInd
     PaWasapiHostApiRepresentation *paWasapi;
 
 #ifndef PA_WINRT
+    // Fail safely for any Windows version below Windows Vista
+    if (GetWindowsVersion() == WINDOWS_UNKNOWN)
+    {
+        PRINT(("WASAPI: Unsupported Windows version!\n"));
+        return paNoError;
+    }
+
     if (!SetupAVRT())
     {
-        PRINT(("WASAPI: No AVRT! (not VISTA?)\n"));
+        PRINT(("WASAPI: avrt.dll missing! Windows integrity broken?\n"));
         return paNoError;
     }
 #endif
@@ -2349,11 +2478,11 @@ PaError PaWasapi_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiInd
 
     // Fill basic interface info
     *hostApi                             = &paWasapi->inheritedHostApiRep;
-    (*hostApi)->info.structVersion         = 1;
-    (*hostApi)->info.type                 = paWASAPI;
-    (*hostApi)->info.name                 = "Windows WASAPI";
+    (*hostApi)->info.structVersion       = 1;
+    (*hostApi)->info.type                = paWASAPI;
+    (*hostApi)->info.name                = "Windows WASAPI";
     (*hostApi)->info.deviceCount         = 0;
-    (*hostApi)->info.defaultInputDevice     = paNoDevice;
+    (*hostApi)->info.defaultInputDevice  = paNoDevice;
     (*hostApi)->info.defaultOutputDevice = paNoDevice;
     (*hostApi)->Terminate                = Terminate;
     (*hostApi)->OpenStream               = OpenStream;
@@ -2630,6 +2759,29 @@ PaError PaWasapi_GetIMMDevice( PaDeviceIndex device, void **pIMMDevice )
     (void)pIMMDevice;
     return paIncompatibleStreamHostApi;
 #endif
+}
+
+// ------------------------------------------------------------------------------------------
+int PaWasapi_IsLoopback( PaDeviceIndex device )
+{
+	PaError ret;
+	PaDeviceIndex index;
+
+	// Get API
+	PaWasapiHostApiRepresentation *paWasapi = _GetHostApi(&ret);
+	if (paWasapi == NULL)
+		return paNotInitialized;
+
+	// Get device index
+	ret = PaUtil_DeviceIndexToHostApiDeviceIndex(&index, device, &paWasapi->inheritedHostApiRep);
+	if (ret != paNoError)
+		return ret;
+
+	// Validate index
+	if ((UINT32)index >= paWasapi->deviceCount)
+		return paInvalidDevice;
+
+	return paWasapi->devInfo[ index ].loopBack;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -3301,7 +3453,7 @@ static HRESULT CreateAudioClient(PaWasapiStream *pStream, PaWasapiSubStream *pSu
     if ((params->channelCount == 1) && (pSub->wavex.Format.nChannels == 2))
     {
         // select mixer
-        pSub->monoMixer = GetMonoToStereoMixer(&pSub->wavex, (pInfo->flow == eRender ? MIX_DIR__1TO2 : MIX_DIR__2TO1_L));
+        pSub->monoMixer = GetMonoToStereoMixer(&pSub->wavex, (output ? MIX_DIR__1TO2 : MIX_DIR__2TO1_L));
         if (pSub->monoMixer == NULL)
         {
             (*pa_error) = paInvalidChannelCount;
@@ -3767,6 +3919,10 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
         goto error;
     }
 
+    // Set stream state
+    stream->isActive  = FALSE;
+    stream->isStopped = TRUE;
+
     // Default thread priority is Audio: for exclusive mode we will use Pro Audio.
     stream->nThreadPriority = eThreadPriorityAudio;
 
@@ -3851,6 +4007,11 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
             (stream->in.shareMode == AUDCLNT_SHAREMODE_SHARED) &&
             ((inputStreamInfo != NULL) && (inputStreamInfo->flags & paWinWasapiAutoConvert)))
             stream->in.streamFlags |= (AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY);
+
+        // Loopback device is a real output device, so we open stream with AUDCLNT_STREAMFLAGS_LOOPBACK
+        // flag to make it work as input device
+        if (info->loopBack)
+            stream->in.streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
         // Fill parameters for Audio Client creation
         stream->in.params.device_info       = info;
@@ -4051,14 +4212,14 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     // Initialize stream representation
     if (streamCallback)
     {
-        stream->bBlocking = FALSE;
+        stream->isBlocking = FALSE;
         PaUtil_InitializeStreamRepresentation(&stream->streamRepresentation,
                                               &paWasapi->callbackStreamInterface,
                                               streamCallback, userData);
     }
     else
     {
-        stream->bBlocking = TRUE;
+        stream->isBlocking = TRUE;
         PaUtil_InitializeStreamRepresentation(&stream->streamRepresentation,
                                               &paWasapi->blockingStreamInterface,
                                               streamCallback, userData);
@@ -4415,8 +4576,11 @@ static PaError StartStream( PaStream *s )
         goto start_error;
     }
 
-    // Create thread
-    if (!stream->bBlocking)
+    // Set stream state
+    stream->isActive  = TRUE;
+    stream->isStopped = FALSE;
+
+    if (!stream->isBlocking)
     {
         // Create thread events
         stream->hThreadStart = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -4506,14 +4670,11 @@ static PaError StartStream( PaStream *s )
             }
         }
 
-        // Set parent to working pointers to use shared functions.
+        // Set parent to working pointers to use shared functions
         stream->captureClient  = stream->captureClientParent;
         stream->renderClient   = stream->renderClientParent;
         stream->in.clientProc  = stream->in.clientParent;
         stream->out.clientProc = stream->out.clientParent;
-
-        // Signal: stream running.
-        stream->running = TRUE;
     }
 
     return result;
@@ -4532,10 +4693,10 @@ start_error:
 }
 
 // ------------------------------------------------------------------------------------------
-void _StreamFinish(PaWasapiStream *stream)
+static void StopStreamByUser(PaWasapiStream *stream)
 {
     // Issue command to thread to stop processing and wait for thread exit
-    if (!stream->bBlocking)
+    if (!stream->isBlocking)
     {
         SignalObjectAndWait(stream->hCloseRequest, stream->hThreadExit, INFINITE, FALSE);
     }
@@ -4555,7 +4716,9 @@ void _StreamFinish(PaWasapiStream *stream)
     // Cleanup handles
     _StreamCleanup(stream);
 
-    stream->running = FALSE;
+    // Set stream state
+    stream->isActive  = FALSE;
+    stream->isStopped = TRUE;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -4574,7 +4737,7 @@ void _StreamCleanup(PaWasapiStream *stream)
 static PaError StopStream( PaStream *s )
 {
     // Finish stream
-    _StreamFinish((PaWasapiStream *)s);
+    StopStreamByUser((PaWasapiStream *)s);
     return paNoError;
 }
 
@@ -4582,20 +4745,20 @@ static PaError StopStream( PaStream *s )
 static PaError AbortStream( PaStream *s )
 {
     // Finish stream
-    _StreamFinish((PaWasapiStream *)s);
+    StopStreamByUser((PaWasapiStream *)s);
     return paNoError;
 }
 
 // ------------------------------------------------------------------------------------------
 static PaError IsStreamStopped( PaStream *s )
 {
-    return !((PaWasapiStream *)s)->running;
+    return ((PaWasapiStream *)s)->isStopped;
 }
 
 // ------------------------------------------------------------------------------------------
 static PaError IsStreamActive( PaStream *s )
 {
-    return ((PaWasapiStream *)s)->running;
+    return ((PaWasapiStream *)s)->isActive;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -4616,6 +4779,18 @@ static double GetStreamCpuLoad( PaStream* s )
 }
 
 // ------------------------------------------------------------------------------------------
+static inline BOOL CheckForStopOrWait(PaWasapiStream *stream, UINT32 delay)
+{
+    return (WaitForSingleObject(stream->hCloseRequest, delay) != WAIT_TIMEOUT);
+}
+
+// ------------------------------------------------------------------------------------------
+static inline BOOL CheckForStop(PaWasapiStream *stream)
+{
+    return CheckForStopOrWait(stream, 0);
+}
+
+// ------------------------------------------------------------------------------------------
 static PaError ReadStream( PaStream* s, void *_buffer, unsigned long frames )
 {
     PaWasapiStream *stream = (PaWasapiStream*)s;
@@ -4629,7 +4804,7 @@ static PaError ReadStream( PaStream* s, void *_buffer, unsigned long frames )
     ThreadIdleScheduler sched;
 
     // validate
-    if (!stream->running)
+    if (!stream->isActive)
         return paStreamIsStopped;
     if (stream->captureClient == NULL)
         return paBadStreamPtr;
@@ -4701,7 +4876,7 @@ static PaError ReadStream( PaStream* s, void *_buffer, unsigned long frames )
     while (frames != 0)
     {
         // Check if blocking call must be interrupted
-        if (WaitForSingleObject(stream->hCloseRequest, sleep) != WAIT_TIMEOUT)
+        if (CheckForStopOrWait(stream, sleep))
             break;
 
         // Get available frames (must be finding out available frames before call to IAudioCaptureClient_GetBuffer
@@ -4799,7 +4974,6 @@ static PaError WriteStream( PaStream* s, const void *_buffer, unsigned long fram
 {
     PaWasapiStream *stream = (PaWasapiStream*)s;
 
-    //UINT32 frames;
     const BYTE *user_buffer = (const BYTE *)_buffer;
     BYTE *wasapi_buffer;
     HRESULT hr = S_OK;
@@ -4808,7 +4982,7 @@ static PaError WriteStream( PaStream* s, const void *_buffer, unsigned long fram
     ThreadIdleScheduler sched;
 
     // validate
-    if (!stream->running)
+    if (!stream->isActive)
         return paStreamIsStopped;
     if (stream->renderClient == NULL)
         return paBadStreamPtr;
@@ -4836,7 +5010,7 @@ static PaError WriteStream( PaStream* s, const void *_buffer, unsigned long fram
     while (frames != 0)
     {
         // Check if blocking call must be interrupted
-        if (WaitForSingleObject(stream->hCloseRequest, sleep) != WAIT_TIMEOUT)
+        if (CheckForStopOrWait(stream, sleep))
             break;
 
         // Get frames available
@@ -4922,7 +5096,7 @@ static signed long GetStreamReadAvailable( PaStream* s )
     UINT32  available = 0;
 
     // validate
-    if (!stream->running)
+    if (!stream->isActive)
         return paStreamIsStopped;
     if (stream->captureClient == NULL)
         return paBadStreamPtr;
@@ -4948,7 +5122,7 @@ static signed long GetStreamWriteAvailable( PaStream* s )
     UINT32  available = 0;
 
     // validate
-    if (!stream->running)
+    if (!stream->isActive)
         return paStreamIsStopped;
     if (stream->renderClient == NULL)
         return paBadStreamPtr;
@@ -5054,19 +5228,9 @@ static void WaspiHostProcessingLoop( void *inputBuffer,  long inputFrames,
 
     PaUtil_EndCpuLoadMeasurement( &stream->cpuLoadMeasurer, framesProcessed );
 
-    if (callbackResult == paContinue)
+    if (callbackResult != paContinue)
     {
-        /* nothing special to do */
-    }
-    else
-    if (callbackResult == paAbort)
-    {
-        // stop stream
-        SetEvent(stream->hCloseRequest);
-    }
-    else
-    {
-        // stop stream
+        // schedule stream stop
         SetEvent(stream->hCloseRequest);
     }
 }
@@ -5566,21 +5730,19 @@ PaError PaWasapi_SetStreamStateHandler( PaStream *pStream, PaWasapiStreamStateCa
 HRESULT _PollGetOutputFramesAvailable(PaWasapiStream *stream, UINT32 *available)
 {
     HRESULT hr;
-    UINT32 frames  = stream->out.framesPerHostCallback,
-           padding = 0;
+    UINT32 frames = stream->out.framesPerHostCallback,
+           padding;
 
     (*available) = 0;
 
-    // get read position
+    // Get read position
     if ((hr = IAudioClient_GetCurrentPadding(stream->out.clientProc, &padding)) != S_OK)
         return LogHostError(hr);
 
-    // get available
-    frames -= padding;
+    // Set available frame count
+    (*available) = frames - padding;
 
-    // set
-    (*available) = frames;
-    return hr;
+    return S_OK;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -5594,14 +5756,14 @@ HRESULT _PollGetInputFramesAvailable(PaWasapiStream *stream, UINT32 *available)
     if ((hr = IAudioClient_GetCurrentPadding(stream->in.clientProc, available)) != S_OK)
         return LogHostError(hr);
 
-    return hr;
+    return S_OK;
 }
 
 // ------------------------------------------------------------------------------------------
 static HRESULT ProcessOutputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor *processor, UINT32 frames)
 {
     HRESULT hr;
-    BYTE *data = NULL;
+    BYTE *data;
 
     // Get buffer
     if ((hr = IAudioRenderClient_GetBuffer(stream->renderClient, frames, &data)) != S_OK)
@@ -5646,23 +5808,19 @@ static HRESULT ProcessOutputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor
     // Process data
     if (stream->out.monoMixer != NULL)
     {
-        // expand buffer
-        UINT32 mono_frames_size = frames * (stream->out.wavex.Format.wBitsPerSample / 8);
-        if (mono_frames_size > stream->out.monoBufferSize)
+        // Expand buffer
+        UINT32 monoFrames = frames * (stream->out.wavex.Format.wBitsPerSample / 8);
+        if (monoFrames > stream->out.monoBufferSize)
         {
-            stream->out.monoBuffer = PaWasapi_ReallocateMemory(stream->out.monoBuffer, (stream->out.monoBufferSize = mono_frames_size));
+            stream->out.monoBuffer = PaWasapi_ReallocateMemory(stream->out.monoBuffer, (stream->out.monoBufferSize = monoFrames));
             if (stream->out.monoBuffer == NULL)
-            {
-                hr = E_OUTOFMEMORY;
-                LogHostError(hr);
-                return hr;
-            }
+                return LogHostError(hr = E_OUTOFMEMORY);
         }
 
-        // process
+        // Process
         processor[S_OUTPUT].processor(NULL, 0, (BYTE *)stream->out.monoBuffer, frames, processor[S_OUTPUT].userData);
 
-        // mix 1 to 2 channels
+        // Mix 1 to 2 channels
         stream->out.monoMixer(data, stream->out.monoBuffer, frames);
     }
     else
@@ -5672,27 +5830,22 @@ static HRESULT ProcessOutputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor
 
     // Release buffer
     if ((hr = IAudioRenderClient_ReleaseBuffer(stream->renderClient, frames, 0)) != S_OK)
-        LogHostError(hr);
+        return LogHostError(hr);
 
-    return hr;
+    return S_OK;
 }
 
 // ------------------------------------------------------------------------------------------
 static HRESULT ProcessInputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor *processor)
 {
-    HRESULT hr = S_OK;
+    HRESULT hr;
     UINT32 frames;
-    BYTE *data = NULL;
-    DWORD flags = 0;
+    BYTE *data;
+    DWORD flags;
 
-    for (;;)
+    while (!CheckForStop(stream))
     {
-        // Check if blocking call must be interrupted
-        if (WaitForSingleObject(stream->hCloseRequest, 0) != WAIT_TIMEOUT)
-            break;
-
         // Find out if any frames available
-        frames = 0;
         if ((hr = _PollGetInputFramesAvailable(stream, &frames)) != S_OK)
             return hr;
 
@@ -5710,7 +5863,6 @@ static HRESULT ProcessInputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor 
             }
 
             return LogHostError(hr);
-            break;
         }
 
         // Detect silence
@@ -5721,16 +5873,12 @@ static HRESULT ProcessInputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor 
         if (stream->in.monoMixer != NULL)
         {
             // expand buffer
-            UINT32 mono_frames_size = frames * (stream->in.wavex.Format.wBitsPerSample / 8);
-            if (mono_frames_size > stream->in.monoBufferSize)
+            UINT32 monoFrames = frames * (stream->in.wavex.Format.wBitsPerSample / 8);
+            if (monoFrames > stream->in.monoBufferSize)
             {
-                stream->in.monoBuffer = PaWasapi_ReallocateMemory(stream->in.monoBuffer, (stream->in.monoBufferSize = mono_frames_size));
+                stream->in.monoBuffer = PaWasapi_ReallocateMemory(stream->in.monoBuffer, (stream->in.monoBufferSize = monoFrames));
                 if (stream->in.monoBuffer == NULL)
-                {
-                    hr = E_OUTOFMEMORY;
-                    LogHostError(hr);
-                    return hr;
-                }
+                    return LogHostError(hr = E_OUTOFMEMORY);
             }
 
             // mix 1 to 2 channels
@@ -5747,18 +5895,16 @@ static HRESULT ProcessInputBuffer(PaWasapiStream *stream, PaWasapiHostProcessor 
         // Release buffer
         if ((hr = IAudioCaptureClient_ReleaseBuffer(stream->captureClient, frames)) != S_OK)
             return LogHostError(hr);
-
-        //break;
     }
 
-    return hr;
+    return S_OK;
 }
 
 // ------------------------------------------------------------------------------------------
 void _StreamOnStop(PaWasapiStream *stream)
 {
     // Stop INPUT/OUTPUT clients
-    if (!stream->bBlocking)
+    if (!stream->isBlocking)
     {
         if (stream->in.clientProc != NULL)
             IAudioClient_Stop(stream->in.clientProc);
@@ -5842,7 +5988,7 @@ PA_THREAD_FUNC ProcThreadEvent(void *param)
     BOOL threadComInitialized = FALSE;
     SystemTimer timer;
 
-    // Notify: state
+    // Notify: WASAPI-specific stream state
     NotifyStateChanged(stream, paWasapiStreamStateThreadPrepare, ERROR_SUCCESS);
 
     // Prepare COM pointers
@@ -5885,8 +6031,8 @@ PA_THREAD_FUNC ProcThreadEvent(void *param)
         goto thread_error;
     }
 
-    // Signal: stream running
-    stream->running = TRUE;
+    // Signal: stream active (reconfirm)
+    stream->isActive = TRUE;
 
     // Notify: thread started
     SetEvent(stream->hThreadStart);
@@ -5941,7 +6087,7 @@ PA_THREAD_FUNC ProcThreadEvent(void *param)
 
     }
 
-    // Notify: state
+    // Notify: WASAPI-specific stream state
     NotifyStateChanged(stream, paWasapiStreamStateThreadStart, ERROR_SUCCESS);
 
     // Processing Loop
@@ -5952,7 +6098,7 @@ PA_THREAD_FUNC ProcThreadEvent(void *param)
 
         // Check for close event (after wait for buffers to avoid any calls to user
         // callback when hCloseRequest was set)
-        if (WaitForSingleObject(stream->hCloseRequest, 0) != WAIT_TIMEOUT)
+        if (CheckForStop(stream))
             break;
 
         // Process S_INPUT/S_OUTPUT
@@ -6004,13 +6150,13 @@ thread_end:
     // Restore system timer granularity
     SystemTimer_RestoreGranularity(&timer);
 
-    // Notify: not running
-    stream->running = FALSE;
+    // Notify: stream inactive
+    stream->isActive = FALSE;
 
     // Notify: thread exited
     SetEvent(stream->hThreadExit);
 
-    // Notify: state
+    // Notify: WASAPI-specific stream state
     NotifyStateChanged(stream, paWasapiStreamStateThreadStop, hr);
 
     return 0;
@@ -6145,7 +6291,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
     LONGLONG startWaitTime;
 #endif
 
-    // Notify: state
+    // Notify: WASAPI-specific stream state
     NotifyStateChanged(stream, paWasapiStreamStateThreadPrepare, ERROR_SUCCESS);
 
     // Prepare COM pointers
@@ -6167,8 +6313,8 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
     // Boost thread priority
     PaWasapi_ThreadPriorityBoost((void **)&stream->hAvTask, stream->nThreadPriority);
 
-    // Signal: stream running
-    stream->running = TRUE;
+    // Signal: stream active (reconfirm)
+    stream->isActive = TRUE;
 
     // Notify: thread started
     SetEvent(stream->hThreadStart);
@@ -6197,7 +6343,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
                 {
                     // It is important to preload whole host buffer to avoid underruns/glitches when stream is started,
                     // for more details see the discussion: https://github.com/PortAudio/portaudio/issues/303
-                    while (frames >= stream->out.framesPerBuffer)
+                    while ((frames >= stream->out.framesPerBuffer) && !CheckForStop(stream))
                     {
                         if ((hr = ProcessOutputBuffer(stream, processor, stream->out.framesPerBuffer)) != S_OK)
                         {
@@ -6240,7 +6386,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
         }
     }
 
-    // Notify: state
+    // Notify: WASAPI-specific stream state
     NotifyStateChanged(stream, paWasapiStreamStateThreadStart, ERROR_SUCCESS);
 
 #ifdef PA_WASAPI_LOG_TIME_SLOTS
@@ -6250,7 +6396,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
     if (!PA_WASAPI__IS_FULLDUPLEX(stream))
     {
         // Processing Loop
-        while (WaitForSingleObject(stream->hCloseRequest, nextSleepTime) == WAIT_TIMEOUT)
+        while (!CheckForStopOrWait(stream, nextSleepTime))
         {
             startTime = SystemTimer_GetTime(&timer);
 
@@ -6307,7 +6453,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
                             continue;
                         }
 
-                        while (framesAvail >= framesProc)
+                        do
                         {
                             if ((hr = ProcessOutputBuffer(stream, processor, framesProc)) != S_OK)
                             {
@@ -6317,6 +6463,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
 
                             framesAvail -= framesProc;
                         }
+                        while ((framesAvail >= framesProc) && !CheckForStop(stream));
                     }
                     else
                     if (framesAvail != 0)
@@ -6343,7 +6490,7 @@ PA_THREAD_FUNC ProcThreadPoll(void *param)
     else
     {
         // Processing Loop (full-duplex)
-        while (WaitForSingleObject(stream->hCloseRequest, nextSleepTime) == WAIT_TIMEOUT)
+        while (!CheckForStopOrWait(stream, nextSleepTime))
         {
             UINT32 i_frames = 0, i_processed = 0, o_frames = 0;
             BYTE *i_data = NULL, *o_data = NULL, *o_data_host = NULL;
@@ -6497,13 +6644,13 @@ thread_end:
     // Restore system timer granularity
     SystemTimer_RestoreGranularity(&timer);
 
-    // Notify: not running
-    stream->running = FALSE;
+    // Notify: state inactive
+    stream->isActive = FALSE;
 
     // Notify: thread exited
     SetEvent(stream->hThreadExit);
 
-    // Notify: state
+    // Notify: WASAPI-specific stream state
     NotifyStateChanged(stream, paWasapiStreamStateThreadStop, hr);
 
     return 0;
