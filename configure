@@ -15839,17 +15839,18 @@ CFLAGS="$CFLAGS -I\$(top_srcdir)/include -I\$(top_srcdir)/src/common"
 case "${host_os}" in
   darwin* )
 
-        $as_echo "#define PA_USE_COREAUDIO 1" >>confdefs.h
+        $as_echo "#define PA_USE_COREAUDIO_IOS 1" >>confdefs.h
 
 
         CFLAGS="$CFLAGS -I\$(top_srcdir)/src/os/unix -Wno-deprecated -Werror"
-        LIBS="-framework CoreAudio -framework AudioToolbox -framework AudioUnit -framework CoreFoundation -framework CoreServices"
+        LIBS="-framework CoreAudio -framework AudioToolbox"
 
         if test "x$enable_mac_universal" = "xyes" ; then
-           mac_version_min="-mmacosx-version-min=10.6"
-           mac_sysroot="-isysroot $(xcrun --sdk macosx --show-sdk-path)"
+           mac_version_min="-mios-version-min=12.1"
+           mac_sysroot="-isysroot $(xcrun --sdk iphoneos --show-sdk-path)"
+
            mac_arches=""
-           for arch in x86_64 arm64
+           for arch in arm64 arm64e
            do
               save_CFLAGS="$CFLAGS"
               CFLAGS="$CFLAGS -arch $arch"
@@ -15875,8 +15876,8 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
            mac_version=""
         fi
         SHARED_FLAGS="$LIBS -dynamiclib $mac_arches $mac_sysroot $mac_version_min"
-        CFLAGS="-std=c99 $CFLAGS $mac_arches $mac_sysroot $mac_version_min"
-        OTHER_OBJS="src/os/unix/pa_unix_hostapis.o src/os/unix/pa_unix_util.o src/hostapi/coreaudio/pa_mac_core.o src/hostapi/coreaudio/pa_mac_core_utilities.o src/hostapi/coreaudio/pa_mac_core_blocking.o src/common/pa_ringbuffer.o"
+	CFLAGS="$CFLAGS -fembed-bitcode-marker -fembed-bitcode -Wno-gnu-statement-expression -Wno-gnu-empty-initializer $mac_arches $mac_sysroot $mac_version_min"
+        OTHER_OBJS="src/os/unix/pa_unix_hostapis.o src/os/unix/pa_unix_util.o src/hostapi/coreaudio_ios/pa_ios_core.o src/hostapi/coreaudio_ios/pa_ios_core_utilities.o src/hostapi/coreaudio_ios/pa_ios_core_blocking.o src/common/pa_ringbuffer.o"
         PADLL="libportaudio.dylib"
         ;;
 
