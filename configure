@@ -15876,7 +15876,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
            mac_version=""
         fi
         SHARED_FLAGS="$LIBS -dynamiclib $mac_arches $mac_sysroot $mac_version_min"
-	CFLAGS="$CFLAGS -fembed-bitcode-marker -fembed-bitcode -Wno-gnu-statement-expression -Wno-gnu-empty-initializer $mac_arches $mac_sysroot $mac_version_min"
+	CFLAGS="$CFLAGS -fembed-bitcode-marker -fembed-bitcode -Wno-unused-but-set-variable -Wno-gnu-statement-expression -Wno-gnu-empty-initializer $mac_arches $mac_sysroot $mac_version_min"
         OTHER_OBJS="src/os/unix/pa_unix_hostapis.o src/os/unix/pa_unix_util.o src/hostapi/coreaudio_ios/pa_ios_core.o src/hostapi/coreaudio_ios/pa_ios_core_utilities.o src/hostapi/coreaudio_ios/pa_ios_core_blocking.o src/common/pa_ringbuffer.o"
         PADLL="libportaudio.dylib"
         ;;
