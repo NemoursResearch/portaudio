@@ -50,3 +50,6 @@ out/
 
 # Visual Studio CMake settings file
 CMakeSettings.json
+
+# Xcode xcuserdata
+portaudio.xcodeproj/xcuserdata
