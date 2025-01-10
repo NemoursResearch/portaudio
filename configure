@@ -15846,11 +15846,22 @@ case "${host_os}" in
         LIBS="-framework CoreAudio -framework AudioToolbox"
 
         if test "x$enable_mac_universal" = "xyes" ; then
-           mac_version_min="-mios-version-min=12.1"
-           mac_sysroot="-isysroot $(xcrun --sdk iphoneos --show-sdk-path)"
-
-           mac_arches=""
-           for arch in arm64 arm64e
+		if test "x$BUILD_ARCH" = "xarm64"; then
+			mac_arches="-arch arm64"
+			loop_arches="arm64 arm64e"
+		elif test "x$BUILD_ARCH" = "xx86_64"; then
+			mac_arches="-arch x86_64"
+			loop_arches="x86_64"
+		fi
+		if test "x$BUILD_SIMULATOR" = "x"; then
+			mac_version_min="-mios-version-min=12.1"
+			mac_sysroot="-isysroot $(xcrun --sdk iphoneos --show-sdk-path)"
+	   	else
+			mac_version_min="-mios-simulator-version-min=12.1"
+			mac_sysroot="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path)"
+		fi
+           
+           for arch in $loop_arches
            do
               save_CFLAGS="$CFLAGS"
               CFLAGS="$CFLAGS -arch $arch"
