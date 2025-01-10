@@ -946,7 +946,7 @@ AudioIOProc(void *inRefCon,
     AudioBufferList * ioData)
 {
 	size_t framesProcessed = 0;
-	PaStreamCallbackTimeInfo timeInfo = {};
+	PaStreamCallbackTimeInfo timeInfo = {0,0,0};
 	PaIosCoreStream *stream = (PaIosCoreStream *) inRefCon;
 	const bool isRender = (inBusNumber == OUTPUT_ELEMENT);
 	int callbackResult = paContinue;
